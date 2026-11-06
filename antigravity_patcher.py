@@ -17,9 +17,11 @@ ide       Antigravity IDE (VS Code fork) — patches the auth gate in
           Verified on the real IDE 2.6.0 build (see VERIFIED_IDE below).
 agy       The language-server binary the IDE 2.6.0 extension downloads on
           first launch into ~/.gemini/bin/agy[.exe] (IDE 2.6.0 no longer
-          ships a language server inside the IDE folder). Binary gates for
-          hasValidAuth / the CLI eligibility screen are tried; exactly one
-          unambiguous match is required.
+          ships a language server inside the IDE folder). It carries two
+          independent gates - the CLI eligibility screen and the hub
+          hasValidAuth validator the IDE actually uses via `agy --hub` -
+          and every gate family present is patched (each must still match
+          unambiguously).
 cli       Standalone Antigravity CLI (agy / agy.exe) found in PATH.
 manager   Antigravity 2.0 desktop app — its Go backend
           resources/bin/language_server[.exe].
@@ -460,28 +462,48 @@ MANAGER_GATE_ARM64 = Gate(
 
 MANAGER_GATE = MultiGate(MANAGER_GATE_X64, MANAGER_GATE_ARM64, desc="hasValidAuth=true")
 
-# The agy binary in ~/.gemini/bin serves the IDE extension with --hub
-# (hasValidAuth gate, x64 verified upstream for the extension build) and is
-# also the CLI binary (eligibility-screen gate). Both gate families are
-# tried for this target; exactly one unambiguous result is required.
-HUB_GATE_X64 = MANAGER_GATE_X64
-AGY_GATES = (CLI_GATE, MultiGate(HUB_GATE_X64, desc="hub hasValidAuth=true"))
+# The agy binary in ~/.gemini/bin is two things at once: the standalone
+# CLI (its own eligibility-screen gate, handleAuthResult) and the IDE
+# extension's language server, launched as `agy --hub`, whose Login /
+# GetAuthStatus verdict comes from a different code site - the
+# PersonalAuthValidator hasValidAuth check. The two gates are independent:
+# patching only the CLI screen leaves the IDE's hub check fully live
+# (observed on macOS ARM64 with IDE 2.6.0: "patched", yet the IDE still
+# showed the regional ineligible error right after browser sign-in).
+# Both families are therefore resolved and patched whenever present.
+# The hub ARM64 signature is the validator build upstream verified for
+# the Manager's arm64 language_server - the same validator code; upstream
+# ships its extension target as x64-only, so on agy/ARM64 this gate is
+# same-code-inferred rather than upstream-verified for agy itself.
+HUB_GATE = MultiGate(MANAGER_GATE_X64, MANAGER_GATE_ARM64,
+                     desc="hub hasValidAuth=true")
+AGY_GATES = (CLI_GATE, HUB_GATE)
 
 
-def _resolve_any_gate(gates, data, ranges, arch):
-    """Resolve exactly one gate out of several families."""
-    matches = []
+def _resolve_all_gates(gates, data, ranges, arch):
+    """Resolve every gate family that matches; at least one must match.
+
+    Ambiguity inside one family still raises - only a family with no
+    signature at all is skipped.
+    """
+    resolved = []
     for gate in gates:
         try:
-            kind, off, g = gate.resolve(data, ranges, arch)
-            matches.append((kind, off, g))
+            resolved.append(gate.resolve(data, ranges, arch))
         except SignatureNotFound:
             pass
-    if len(matches) > 1:
-        raise SignatureAmbiguous("multiple gate signatures matched - refusing to guess")
-    if not matches:
+    if not resolved:
         raise SignatureNotFound("no gate signature matched (unsupported version?)")
-    return matches[0]
+    return resolved
+
+
+def _multi_state(resolved):
+    kinds = {kind for kind, _off, _g in resolved}
+    if kinds == {"patched"}:
+        return "patched"
+    if kinds == {"unpatched"}:
+        return "unpatched"
+    return "partial"
 
 
 # --------------------------------------------------------------------------
@@ -502,9 +524,9 @@ def make_backup(path, status_fn):
                 raise OSError("backup already contains a patch; restore a pristine "
                               "original before patching again")
             return bak
-        if status_fn(path)[0] == "patched":
-            # current file is patched and differs from backup: backup must be
-            # the pristine original - verify before trusting it.
+        if status_fn(path)[0] in ("patched", "partial"):
+            # current file is (partly) patched and differs from backup:
+            # backup must be the pristine original - verify before trusting it.
             if status_fn(bak)[0] != "unpatched":
                 raise OSError("existing backup is not a recognized clean original - "
                               "refusing to patch on top of it")
@@ -565,7 +587,7 @@ def gate_status(path, gates):
         with mapped(path) as d:
             if isinstance(gates, (Gate, MultiGate)):
                 return (gates.resolve(d, ranges, arch)[0], None)
-            return (_resolve_any_gate(gates, d, ranges, arch)[0], None)
+            return (_multi_state(_resolve_all_gates(gates, d, ranges, arch)), None)
     except (LookupError, OSError, ValueError):
         return ("unknown", None)
 
@@ -573,19 +595,21 @@ def gate_status(path, gates):
 def gate_patch(path, gates, app):
     if is_locked(path, app):
         return False
+    multi = not isinstance(gates, (Gate, MultiGate))
     try:
         ranges, arch = executable_info(path)
         with mapped(path) as d:
-            if isinstance(gates, (Gate, MultiGate)):
-                kind, off, g = gates.resolve(d, ranges, arch)
+            if multi:
+                resolved = _resolve_all_gates(gates, d, ranges, arch)
             else:
-                kind, off, g = _resolve_any_gate(gates, d, ranges, arch)
+                resolved = [gates.resolve(d, ranges, arch)]
     except (LookupError, OSError, ValueError) as e:
         warn(str(e))
         return False
-    if kind == "patched":
+    if all(kind == "patched" for kind, _off, _g in resolved):
         ok(f"{app} already patched")
         return True
+    todo = [(off, g) for kind, off, g in resolved if kind == "unpatched"]
     status_fn = lambda p: gate_status(p, gates)
     try:
         bak = make_backup(path, status_fn)
@@ -596,31 +620,35 @@ def gate_patch(path, gates, app):
         with tempfile.TemporaryDirectory(prefix="agy-patch-") as temp:
             before = os.path.join(temp, "before")
             shutil.copy2(path, before)
-            if not _files_equal(path, before) or not _files_equal(before, bak):
+            if not _files_equal(path, before):
                 raise OSError("target changed after backup")
-            # re-scan the snapshot we are about to patch
+            # re-scan the snapshot we are about to patch: the same gate set
+            # at the same offsets, with the same per-gate states.
             ranges, arch = executable_info(before)
             with mapped(before) as d:
-                if isinstance(gates, (Gate, MultiGate)):
-                    cur_kind, cur_off, cur_g = gates.resolve(d, ranges, arch)
+                if multi:
+                    cur = _resolve_all_gates(gates, d, ranges, arch)
                 else:
-                    cur_kind, cur_off, cur_g = _resolve_any_gate(gates, d, ranges, arch)
-            if cur_kind != "unpatched" or cur_off != off or cur_g is not g:
+                    cur = [gates.resolve(d, ranges, arch)]
+            if [(k, o, g.desc) for k, o, g in cur] != \
+                    [(k, o, g.desc) for k, o, g in resolved]:
                 raise OSError("target changed before patch write")
             if not _files_equal(path, before):
                 raise OSError("target changed before patch write")
             if sys.platform == "darwin":
                 # Never write in place into a signed Mach-O: build the patched
                 # copy on a sibling inode and atomically replace. The binary
-                # fix is length-preserving, so the offsets stay valid.
+                # fixes are length-preserving, so the offsets stay valid.
                 with open(before, "rb") as f:
                     patched_bytes = bytearray(f.read())
-                patched_bytes[off:off + len(g.fix)] = g.fix
+                for off, g in todo:
+                    patched_bytes[off:off + len(g.fix)] = g.fix
                 _mac_replace_file(path, bytes(patched_bytes), before)
             else:
                 with open(path, "r+b") as f:
-                    f.seek(off)
-                    f.write(g.fix)
+                    for off, g in todo:
+                        f.seek(off)
+                        f.write(g.fix)
                     f.flush()
                     os.fsync(f.fileno())
     except Exception as e:
@@ -646,7 +674,8 @@ def gate_patch(path, gates, app):
             pass
         warn(f"{app} patch failed: post-write signature verification failed")
         return False
-    ok(f"{app} patched ({g.desc} @ file 0x{off:x})")
+    for off, g in todo:
+        ok(f"{app} patched ({g.desc} @ file 0x{off:x})")
     return True
 
 
