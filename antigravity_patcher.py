@@ -1680,13 +1680,41 @@ def status_json(targets, overrides):
     return out
 
 
+ACTIONS = ("status", "patch", "restore")
+_VALUE_OPTIONS = ("--path-ide", "--path-agy", "--path-cli", "--path-manager")
+
+
+def _split_cli(argv):
+    """Split argv into (action, targets, option tokens) by hand.
+
+    argparse's matching for an optional positional followed by a `*`
+    positional is version-dependent: on some Python builds (seen on
+    macOS) a lone `status` is consumed by the targets positional and the
+    command then fails demanding a target. Splitting positionals manually
+    makes `status` / `patch` / `restore` behave the same everywhere.
+    """
+    action, targets, opts = None, [], []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in _VALUE_OPTIONS and i + 1 < len(argv):
+            opts += [tok, argv[i + 1]]
+            i += 2
+        elif tok.startswith("-"):
+            opts.append(tok)
+            i += 1
+        elif tok in ACTIONS and action is None and not targets:
+            action = tok
+            i += 1
+        else:
+            targets.append(tok)
+            i += 1
+    return action, targets, opts
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="Antigravity eligibility patcher (IDE 2.6.0 supported)")
-    ap.add_argument("action", nargs="?", choices=("status", "patch", "restore"),
-                    help="default: interactive-less status when omitted")
-    ap.add_argument("targets", nargs="*", choices=TARGETS,
-                    help="subset of targets (default: all)")
     ap.add_argument("--path-ide", dest="path_ide")
     ap.add_argument("--path-agy", dest="path_agy")
     ap.add_argument("--path-cli", dest="path_cli")
@@ -1699,9 +1727,16 @@ def main(argv=None):
                          "reject the ad-hoc re-signed bundle, add the "
                          "disable-library-validation entitlement to the app's "
                          "main executable only")
-    args = ap.parse_args(argv)
+    action, target_args, opt_tokens = _split_cli(
+        list(sys.argv[1:] if argv is None else argv))
+    args = ap.parse_args(opt_tokens)
+    bad = [t for t in target_args if t not in TARGETS]
+    if bad:
+        ap.error(f"invalid target(s): {', '.join(bad)} "
+                 f"(choose from {', '.join(TARGETS)})")
+    args.action = action
     overrides = {t: getattr(args, f"path_{t}") for t in TARGETS}
-    targets = args.targets or list(TARGETS)
+    targets = target_args or list(TARGETS)
     if args.json or not args.action:
         if args.json:
             print(json.dumps(status_json(targets, overrides), indent=2, ensure_ascii=False))

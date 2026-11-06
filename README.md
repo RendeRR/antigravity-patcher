@@ -138,6 +138,7 @@ Library Validation, полный цикл patch→sign→restore на фейко
 - `VERIFICATION.md` — протокол проверки на IDE 2.6.0.
 - `tests_macos.py` — тесты логики macOS-подписи (codesign замокирован).
 - `tests_multi_gate.py` — тесты двух гейтов `agy` на фикстурах Mach-O arm64 и PE x64.
+- `tests_cli.py` — регрессионные тесты разбора командной строки (`status` без цели и др.).
 - `LICENSE` — MIT, с атрибуцией QNIX-Dev.
 
 ## Лицензия и кредиты
