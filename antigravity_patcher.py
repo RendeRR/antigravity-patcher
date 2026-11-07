@@ -1382,35 +1382,44 @@ def _mac_run_patch(targets, overrides, disable_library_validation=False):
             rc = 1
             continue
         try:
-            before = spec["status"](path)[0]
+            digest_before = _sha256(path)
             fn = spec["patch"]
             success = fn(path, dry_run=False) if t == "ide" else fn(path)
             if not success:
                 rc = 1
                 continue
             successful[t] = path
-            if before == "unpatched" and spec["status"](path)[0] == "patched":
+            if _sha256(path) != digest_before:
                 changed.append((t, path))
         except Exception as e:
             warn(f"error: {e}")
             rc = 1
     if successful:
-        try:
-            if signing_entitlements:
-                _mac_sign_transaction(successful, bundle_entitlements=signing_entitlements)
-            else:
-                _mac_sign_transaction(successful)
-        except Exception as e:
-            warn(f"macOS code signing failed: {e}")
-            for target, path in reversed(changed):
-                if not restore_file(path, SPEC[target]["status"]):
-                    warn(f"automatic rollback failed for {path}")
-            return 1
-        try:
-            _mac_remove_quarantine(successful)
-        except Exception as e:
-            warn(f"couldn't remove macOS quarantine: {e}")
-            rc = 1
+        # Signing belongs to applying a change, not to the patch command
+        # itself: a target whose bytes did not move in this run keeps the
+        # signature it already has. (Re-signing untouched targets on every
+        # no-op `patch` run was reported live on a Mac - confusing and
+        # pointless.) An explicit entitlements request is itself a change
+        # request, so it still signs every successful target.
+        to_sign = successful if signing_entitlements else dict(changed)
+        if to_sign:
+            try:
+                if signing_entitlements:
+                    _mac_sign_transaction(to_sign,
+                                          bundle_entitlements=signing_entitlements)
+                else:
+                    _mac_sign_transaction(to_sign)
+            except Exception as e:
+                warn(f"macOS code signing failed: {e}")
+                for target, path in reversed(changed):
+                    if not restore_file(path, SPEC[target]["status"]):
+                        warn(f"automatic rollback failed for {path}")
+                return 1
+            try:
+                _mac_remove_quarantine(to_sign)
+            except Exception as e:
+                warn(f"couldn't remove macOS quarantine: {e}")
+                rc = 1
     return rc
 
 

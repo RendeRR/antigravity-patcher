@@ -162,5 +162,29 @@ class DarwinFlowTests(unittest.TestCase):
             self.assertEqual(open(main_js, "rb").read(), original)
 
 
+class NoopSignSkipTests(unittest.TestCase):
+    def test_second_patch_run_does_not_resign(self):
+        from tests_multi_gate import build_macho
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = os.path.join(tmp, "agy")
+            build_macho(fixture)
+            sign_calls, quarantine_calls = [], []
+            with mock.patch.object(ap, "_mac_sign_transaction",
+                                   side_effect=lambda targets, **kw: sign_calls.append(dict(targets))), \
+                 mock.patch.object(ap, "_mac_remove_quarantine",
+                                   side_effect=lambda targets: quarantine_calls.append(dict(targets))), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                rc = ap._mac_run_patch(["agy"], {"agy": fixture})
+                self.assertEqual(rc, 0)
+                self.assertEqual(ap.gate_status(fixture, ap.AGY_GATES)[0], "patched")
+                self.assertEqual(len(sign_calls), 1)
+                self.assertEqual(len(quarantine_calls), 1)
+                rc = ap._mac_run_patch(["agy"], {"agy": fixture})
+                self.assertEqual(rc, 0)
+                self.assertEqual(len(sign_calls), 1,
+                                 "no-op patch run must not re-sign")
+                self.assertEqual(len(quarantine_calls), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
