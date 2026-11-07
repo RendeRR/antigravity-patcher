@@ -138,10 +138,10 @@ python3 antigravity_patcher.py --path-agy ~/.gemini/bin/agy patch agy
 
 - `antigravity_patcher.py` — сам патчер (один файл, стандартная библиотека Python).
 - `VERIFICATION.md` — протокол проверки на IDE 2.6.0.
-- `tests_macos.py`, `tests_multi_gate.py`, `tests_cli.py` — тесты (подпись macOS,
-  два гейта agy, разбор командной строки).
-- `upstream/` — клон исходного проекта QNIX-Dev (MIT), взятого за основу
-  (только в рабочей папке, в опубликованный репозиторий не входит).
+- `tests_macos.py` — тесты логики macOS-подписи (codesign замокирован).
+- `tests_multi_gate.py` — тесты двух гейтов `agy` на фикстурах Mach-O arm64 и PE x64.
+- `tests_cli.py` — регрессионные тесты разбора командной строки ("status" без цели и др.).
+- `LICENSE` — MIT, с атрибуцией QNIX-Dev.
 
 ## Лицензия и кредиты
 
