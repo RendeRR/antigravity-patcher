@@ -145,6 +145,16 @@ def is_locked(path, app=None):
         if app:
             if e.errno == errno.ETXTBSY or getattr(e, "winerror", None) in (32, 33):
                 warn(f"{os.path.basename(path)} is in use - close {app} first")
+            elif e.errno == errno.EPERM and sys.platform == "darwin":
+                # On macOS 13+ everything inside an installed .app is guarded
+                # by TCC "App Management". Ownership and sudo are irrelevant
+                # there: the fix is a one-time permission grant, so advising
+                # "use an account with write access" sends the user down the
+                # wrong path entirely (reported live on macOS 15 / 2.33.0).
+                warn(f"macOS blocked writing inside {app} "
+                     f"(App Management permission)")
+                warn("  grant it once in System Settings > Privacy & Security "
+                     "> App Management, then re-run patch")
             elif e.errno in (errno.EACCES, errno.EPERM):
                 warn(f"permission denied writing {path} - use an account with "
                      "write access to the installation (sudo / Administrator)")
@@ -588,8 +598,11 @@ def gate_status(path, gates):
             if isinstance(gates, (Gate, MultiGate)):
                 return (gates.resolve(d, ranges, arch)[0], None)
             return (_multi_state(_resolve_all_gates(gates, d, ranges, arch)), None)
-    except (LookupError, OSError, ValueError):
-        return ("unknown", None)
+    except (LookupError, OSError, ValueError) as e:
+        # Keep the reason: "unknown" alone tells a user nothing, and the most
+        # common cause (a build whose gates moved) is exactly what the message
+        # names. Callers that only need the state read element [0].
+        return ("unknown", str(e))
 
 
 def gate_patch(path, gates, app):
@@ -1420,6 +1433,11 @@ def _mac_run_patch(targets, overrides, disable_library_validation=False):
             except Exception as e:
                 warn(f"couldn't remove macOS quarantine: {e}")
                 rc = 1
+    for target, path in successful.items():
+        try:
+            record_patch_state(target, path)
+        except OSError as e:
+            warn(f"couldn't record patch state for {path}: {e}")
     return rc
 
 
@@ -1449,6 +1467,10 @@ def _mac_run_restore(targets, overrides):
                     touched_apps.append(app)
                 if app:
                     restored.setdefault(app, {})[t] = path
+                try:
+                    forget_patch_state(t, path)
+                except OSError:
+                    pass
             else:
                 warn(f"{spec['name']} not patched - skipping restore")
         except Exception as e:
@@ -1602,6 +1624,113 @@ def manager_default_bins():
     return _posix_find(rel, "antigravity")
 
 
+# --------------------------------------------------------------------------
+# patch state: notice that an app update silently replaced the patch
+# --------------------------------------------------------------------------
+#
+# Antigravity updates itself by swapping the whole bundle, which drops the
+# patched binary and its .agybak backup with it. The user then sees the region
+# lock come back with no hint that the cause is an update, so we leave a tiny
+# sidecar note outside the bundle (updates cannot remove it) and compare it on
+# later runs.
+
+PATCH_STATE = ".agypatchstate.json"
+
+
+def _bundle_version(path):
+    """CFBundleShortVersionString of the enclosing .app bundle, or None."""
+    app = _mac_app_bundle(path)
+    if not app:
+        return None
+    try:
+        with open(os.path.join(app, "Contents", "Info.plist"), "rb") as f:
+            version = plistlib.load(f).get("CFBundleShortVersionString")
+    except (OSError, ValueError):
+        return None
+    return str(version) if version else None
+
+
+def target_version(target, path):
+    """Version of the product a target belongs to, or None when unknown."""
+    if target == "ide":
+        return ide_version(path)
+    if target == "manager":
+        return _bundle_version(path)
+    return None
+
+
+def _state_path(target, path):
+    """Sidecar state file, deliberately outside the bundle."""
+    app = _mac_app_bundle(path)
+    if app:
+        return app + PATCH_STATE
+    return path + PATCH_STATE
+
+
+def record_patch_state(target, path):
+    """Remember what was patched so a later status can spot a lost patch."""
+    st = _state_path(target, path)
+    data = {}
+    if os.path.exists(st):
+        try:
+            with open(st, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = {}
+    data[target] = {
+        "version": target_version(target, path),
+        "binary": os.path.basename(path),
+        "sha256": _sha256(path),
+        "patched_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    tmp = st + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, st)
+
+
+def forget_patch_state(target, path):
+    st = _state_path(target, path)
+    try:
+        with open(st, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return
+    if data.pop(target, None) is None:
+        return
+    try:
+        if data:
+            with open(st, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+                f.write("\n")
+        else:
+            os.unlink(st)
+    except OSError:
+        pass
+
+
+def patch_state_warning(target, path, state):
+    """Explain why a previously patched target looks unpatched again."""
+    if state == "patched":
+        return None
+    st = _state_path(target, path)
+    if not os.path.exists(st):
+        return None
+    try:
+        with open(st, "r", encoding="utf-8") as f:
+            rec = json.load(f).get(target)
+    except (OSError, ValueError):
+        return None
+    if not rec:
+        return None
+    was, now = rec.get("version"), target_version(target, path)
+    if was and now and was != now:
+        return (f"patch lost: app updated {was} -> {now}; the update restored "
+                f"the original binary - re-run patch")
+    return "patch lost: the binary changed since it was patched - re-run patch"
+
+
 SPEC = {
     "ide": dict(name="Antigravity IDE", find=ide_default_mains,
                 status=ide_status, patch=ide_patch),
@@ -1643,13 +1772,18 @@ def run(action, targets, overrides, dry_run=False, macos_disable_library_validat
             if not path:
                 print(f"  {spec['name']:<42} not found")
                 continue
-            state, _ = spec["status"](path)
+            state, reason = spec["status"](path)
             extra = ""
-            if t == "ide":
-                v = ide_version(path)
-                if v:
-                    extra = f" (IDE {v})"
+            version = target_version(t, path)
+            if version:
+                label = {"ide": "IDE", "manager": "Manager"}.get(t, "")
+                extra = f" ({label} {version})" if label else f" ({version})"
             print(f"  {spec['name']:<42} {state:<10} {path}{extra}")
+            if state == "unknown" and reason:
+                warn(f"{spec['name']}: {reason}")
+            lost = patch_state_warning(t, path, state)
+            if lost:
+                warn(f"{spec['name']}: {lost}")
             continue
         if not path:
             if t == "agy" and action == "patch":
@@ -1665,6 +1799,11 @@ def run(action, targets, overrides, dry_run=False, macos_disable_library_validat
             success = fn(path, dry_run=dry_run) if t == "ide" else fn(path)
             if not success:
                 rc = 1
+            elif not dry_run:
+                try:
+                    record_patch_state(t, path)
+                except OSError as e:
+                    warn(f"couldn't record patch state for {path}: {e}")
         elif action == "restore":
             if not restore_file(path, spec["status"]):
                 rc = 1
@@ -1679,12 +1818,19 @@ def status_json(targets, overrides):
         if not path:
             out[t] = {"name": spec["name"], "found": False}
             continue
-        state, _ = spec["status"](path)
+        state, reason = spec["status"](path)
         entry = {"name": spec["name"], "found": True, "path": path, "state": state,
                  "sha256": _sha256(path)}
         if t == "ide":
             entry["ide_version"] = ide_version(path)
             entry["verified"] = entry["ide_version"] in VERIFIED_IDE
+        elif t == "manager":
+            entry["manager_version"] = target_version(t, path)
+        if state == "unknown" and reason:
+            entry["reason"] = reason
+        lost = patch_state_warning(t, path, state)
+        if lost:
+            entry["patch_lost"] = lost
         out[t] = entry
     return out
 
